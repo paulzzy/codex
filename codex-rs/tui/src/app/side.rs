@@ -15,8 +15,10 @@ use codex_app_server_protocol::TurnInterruptParams;
 use codex_app_server_protocol::TurnInterruptResponse;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use std::time::Duration;
 
 const SIDE_RENAME_BLOCK_MESSAGE: &str = "Side conversations are ephemeral and cannot be renamed.";
+const SIDE_START_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const SIDE_MAIN_THREAD_UNAVAILABLE_MESSAGE: &str =
     "'/side' is unavailable until the main thread is ready.";
 const SIDE_NO_STARTED_CONVERSATION_MESSAGE: &str = concat!(
@@ -685,11 +687,13 @@ impl App {
             .await;
 
         let fork_config = self.side_fork_config();
-        match app_server
-            .fork_side_thread(fork_config, parent_thread_id)
-            .await
+        match tokio::time::timeout(
+            SIDE_START_REQUEST_TIMEOUT,
+            app_server.fork_side_thread(fork_config, parent_thread_id),
+        )
+        .await
         {
-            Ok(forked) => {
+            Ok(Ok(forked)) => {
                 let child_thread_id = forked.session.thread_id;
                 let channel = self.ensure_thread_channel(child_thread_id);
                 {
@@ -706,40 +710,80 @@ impl App {
                     /*agent_role*/ None,
                     /*is_closed*/ false,
                 );
-                if let Err(err) = app_server
-                    .thread_inject_items(child_thread_id, vec![Self::side_boundary_prompt_item()])
-                    .await
+                match tokio::time::timeout(
+                    SIDE_START_REQUEST_TIMEOUT,
+                    app_server.thread_inject_items(
+                        child_thread_id,
+                        vec![Self::side_boundary_prompt_item()],
+                    ),
+                )
+                .await
                 {
-                    self.discard_side_thread_or_keep_visible(tui, app_server, child_thread_id)
-                        .await;
-                    self.restore_side_user_message(user_message.take());
-                    self.chat_widget.add_error_message(format!(
-                        "Failed to prepare side conversation {child_thread_id}: {err}"
-                    ));
-                    return Ok(AppRunControl::Continue);
-                }
-                if let Err(err) = self
-                    .select_agent_thread_and_discard_side(tui, app_server, child_thread_id)
-                    .await
-                {
-                    let discarded = self
-                        .discard_side_thread_or_keep_visible(tui, app_server, child_thread_id)
-                        .await;
-                    if discarded
-                        && self.active_thread_id != Some(parent_thread_id)
-                        && let Err(restore_err) = self
-                            .select_agent_thread(tui, app_server, parent_thread_id)
-                            .await
-                    {
-                        tracing::warn!(
-                            "failed to restore parent thread after side conversation switch failure: {restore_err}"
-                        );
+                    Ok(Ok(_)) => {}
+                    Ok(Err(err)) => {
+                        self.discard_side_thread_or_keep_visible(tui, app_server, child_thread_id)
+                            .await;
+                        self.restore_side_user_message(user_message.take());
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to prepare side conversation {child_thread_id}: {err}"
+                        ));
+                        return Ok(AppRunControl::Continue);
                     }
-                    self.restore_side_user_message(user_message.take());
-                    self.chat_widget.add_error_message(format!(
-                        "Failed to switch into side conversation {child_thread_id}: {err}"
-                    ));
-                    return Ok(AppRunControl::Continue);
+                    Err(_) => {
+                        self.discard_side_thread_in_background(app_server, child_thread_id)
+                            .await;
+                        self.restore_side_user_message(user_message.take());
+                        self.chat_widget.add_error_message(format!(
+                            "Timed out preparing side conversation {child_thread_id}."
+                        ));
+                        return Ok(AppRunControl::Continue);
+                    }
+                }
+                match tokio::time::timeout(
+                    SIDE_START_REQUEST_TIMEOUT,
+                    self.select_agent_thread_and_discard_side(tui, app_server, child_thread_id),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        let discarded = self
+                            .discard_side_thread_or_keep_visible(tui, app_server, child_thread_id)
+                            .await;
+                        if discarded
+                            && self.active_thread_id != Some(parent_thread_id)
+                            && let Err(restore_err) = self
+                                .select_agent_thread(tui, app_server, parent_thread_id)
+                                .await
+                        {
+                            tracing::warn!(
+                                "failed to restore parent thread after side conversation switch failure: {restore_err}"
+                            );
+                        }
+                        self.restore_side_user_message(user_message.take());
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to switch into side conversation {child_thread_id}: {err}"
+                        ));
+                        return Ok(AppRunControl::Continue);
+                    }
+                    Err(_) => {
+                        self.discard_side_thread_in_background(app_server, child_thread_id)
+                            .await;
+                        if self.active_thread_id != Some(parent_thread_id)
+                            && let Err(restore_err) = self
+                                .select_agent_thread(tui, app_server, parent_thread_id)
+                                .await
+                        {
+                            tracing::warn!(
+                                "failed to restore parent thread after side conversation timeout: {restore_err}"
+                            );
+                        }
+                        self.restore_side_user_message(user_message.take());
+                        self.chat_widget.add_error_message(format!(
+                            "Timed out switching into side conversation {child_thread_id}."
+                        ));
+                        return Ok(AppRunControl::Continue);
+                    }
                 }
                 if self.active_thread_id == Some(child_thread_id) {
                     if let Some(user_message) = user_message.take() {
@@ -756,12 +800,19 @@ impl App {
                     ));
                 }
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 self.restore_side_user_message(user_message.take());
                 self.chat_widget
                     .set_side_conversation_context_label(/*label*/ None);
                 self.chat_widget
                     .add_error_message(Self::side_start_error_message(&err));
+            }
+            Err(_) => {
+                self.restore_side_user_message(user_message.take());
+                self.chat_widget
+                    .set_side_conversation_context_label(/*label*/ None);
+                self.chat_widget
+                    .add_error_message("Timed out starting side conversation.".to_string());
             }
         }
 
