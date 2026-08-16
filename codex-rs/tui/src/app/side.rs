@@ -458,6 +458,15 @@ impl App {
         app_server: &mut AppServerSession,
         thread_id: ThreadId,
     ) {
+        if !self.abandoned_side_threads.insert(thread_id) {
+            return;
+        }
+        let recovery_state = self.side_threads.remove(&thread_id);
+        self.side_cleanup_recovery.insert(thread_id, recovery_state);
+        self.pending_side_threads.remove(&thread_id);
+        self.agent_navigation.remove(thread_id);
+        self.sync_active_agent_label();
+
         let turn_id = self
             .active_turn_id_for_thread(thread_id)
             .await
@@ -466,9 +475,7 @@ impl App {
         let interrupt_request_id = app_server.next_request_id();
         let retry_interrupt_request_id = app_server.next_request_id();
         let unsubscribe_request_id = app_server.next_request_id();
-
-        self.abandoned_side_threads.insert(thread_id);
-        self.discard_thread_local_state(thread_id).await;
+        let app_event_tx = self.app_event_tx.clone();
 
         tokio::spawn(async move {
             let interrupt_result = request_handle
@@ -495,21 +502,70 @@ impl App {
             } else {
                 interrupt_result
             };
-            if let Err(error) = interrupt_result {
-                tracing::warn!(%error, "failed to interrupt side conversation");
-            }
-            if let Err(error) = request_handle
+            let unsubscribe_result = request_handle
                 .request_typed::<ThreadUnsubscribeResponse>(ClientRequest::ThreadUnsubscribe {
                     request_id: unsubscribe_request_id,
                     params: ThreadUnsubscribeParams {
                         thread_id: thread_id.to_string(),
                     },
                 })
-                .await
-            {
-                tracing::warn!(%error, "failed to unsubscribe side conversation");
-            }
+                .await;
+            let result = match (interrupt_result, unsubscribe_result) {
+                (Ok(_), Ok(_)) => Ok(()),
+                (Err(interrupt_error), Ok(_)) => {
+                    tracing::warn!(
+                        error = %interrupt_error,
+                        "side conversation was unsubscribed after interrupt failed"
+                    );
+                    Ok(())
+                }
+                (Ok(_), Err(unsubscribe_error)) => {
+                    Err(format!("thread/unsubscribe failed: {unsubscribe_error}"))
+                }
+                (Err(interrupt_error), Err(unsubscribe_error)) => Err(format!(
+                    "turn/interrupt failed: {interrupt_error}; thread/unsubscribe failed: \
+                     {unsubscribe_error}"
+                )),
+            };
+            app_event_tx.send(AppEvent::SideThreadCleanupFinished { thread_id, result });
         });
+    }
+
+    pub(super) async fn handle_side_thread_cleanup_finished(
+        &mut self,
+        thread_id: ThreadId,
+        result: std::result::Result<(), String>,
+    ) {
+        let Some(recovery_state) = self.side_cleanup_recovery.remove(&thread_id) else {
+            return;
+        };
+        self.pending_side_threads.remove(&thread_id);
+        match result {
+            Ok(()) => self.discard_thread_local_state(thread_id).await,
+            Err(error) => {
+                let Some(recovery_state) = recovery_state else {
+                    tracing::warn!(
+                        %thread_id,
+                        %error,
+                        "side cleanup failed after its session was replaced; keeping it hidden"
+                    );
+                    self.discard_thread_local_state(thread_id).await;
+                    return;
+                };
+                self.abandoned_side_threads.remove(&thread_id);
+                self.side_threads.insert(thread_id, recovery_state);
+                if self.thread_event_channels.contains_key(&thread_id) {
+                    self.upsert_agent_picker_thread(
+                        thread_id, /*agent_nickname*/ None, /*agent_role*/ None,
+                        /*is_closed*/ false,
+                    );
+                }
+                self.chat_widget.add_error_message(format!(
+                    "Failed to close side conversation {thread_id}; it is still open: {error}"
+                ));
+                self.sync_active_agent_label();
+            }
+        }
     }
 
     pub(super) async fn discard_closed_side_thread(&mut self, thread_id: ThreadId) {
@@ -520,6 +576,8 @@ impl App {
         self.abort_thread_event_listener(thread_id);
         self.thread_event_channels.remove(&thread_id);
         self.side_threads.remove(&thread_id);
+        self.pending_side_threads.remove(&thread_id);
+        self.side_cleanup_recovery.remove(&thread_id);
         self.agent_navigation.remove(thread_id);
         if self.active_thread_id == Some(thread_id) {
             self.clear_active_thread().await;
@@ -586,11 +644,59 @@ impl App {
             Some("A side conversation is already starting.")
         } else if self.primary_thread_id.is_none() {
             Some(SIDE_MAIN_THREAD_UNAVAILABLE_MESSAGE)
-        } else if self.active_side_parent_thread_id().is_some() {
+        } else if !self.side_threads.is_empty()
+            || self.side_cleanup_recovery.values().any(Option::is_some)
+        {
             Some(SIDE_ALREADY_OPEN_MESSAGE)
         } else {
             None
         }
+    }
+
+    pub(super) fn note_pending_side_thread_started(
+        &mut self,
+        thread_id: ThreadId,
+        notification: &ServerNotification,
+    ) -> bool {
+        let ServerNotification::ThreadStarted(notification) = notification else {
+            return self.pending_side_threads.contains(&thread_id);
+        };
+        if !notification.thread.ephemeral {
+            return false;
+        }
+        let Some(parent_thread_id) = notification
+            .thread
+            .forked_from_id
+            .as_deref()
+            .and_then(|thread_id| ThreadId::from_string(thread_id).ok())
+        else {
+            return false;
+        };
+        let belongs_to_pending_start = self
+            .pending_side_start
+            .as_ref()
+            .is_some_and(|pending| pending.side_state.parent_thread_id == parent_thread_id)
+            || self
+                .canceled_side_start_parents
+                .values()
+                .any(|candidate| *candidate == parent_thread_id);
+        if belongs_to_pending_start {
+            self.pending_side_threads.insert(thread_id);
+        }
+        belongs_to_pending_start
+    }
+
+    pub(super) fn cancel_pending_side_start_for_session_reset(
+        &mut self,
+    ) -> Option<crate::chatwidget::UserMessage> {
+        let PendingSideStart {
+            request_id,
+            side_state,
+            user_message,
+        } = self.pending_side_start.take()?;
+        self.canceled_side_start_parents
+            .insert(request_id, side_state.parent_thread_id);
+        user_message
     }
 
     pub(super) fn side_start_error_message(err: &color_eyre::Report) -> String {
@@ -612,6 +718,38 @@ impl App {
         if let Some(user_message) = user_message {
             self.chat_widget
                 .restore_user_message_to_composer(user_message);
+        }
+    }
+
+    pub(super) async fn restore_side_user_message_for_thread(
+        &mut self,
+        thread_id: ThreadId,
+        user_message: Option<crate::chatwidget::UserMessage>,
+    ) {
+        let Some(user_message) = user_message else {
+            return;
+        };
+        if self.current_displayed_thread_id() == Some(thread_id) {
+            self.chat_widget
+                .restore_user_message_to_composer(user_message);
+            return;
+        }
+        let Some(channel) = self.thread_event_channels.get(&thread_id) else {
+            tracing::warn!(
+                %thread_id,
+                "could not restore side-conversation prompt because its parent channel is gone"
+            );
+            return;
+        };
+        let mut store = channel.store.lock().await;
+        if !crate::chatwidget::ChatWidget::restore_user_message_to_thread_input_state(
+            &mut store.input_state,
+            user_message,
+        ) {
+            tracing::warn!(
+                %thread_id,
+                "could not restore side-conversation prompt because its parent input state is gone"
+            );
         }
     }
 
@@ -658,10 +796,12 @@ impl App {
             return Ok(());
         }
 
-        if let Some((&side_thread_id, _)) = self.side_threads.iter().next() {
-            self.discard_side_thread_in_background(app_server, side_thread_id)
-                .await;
-        }
+        let request_id = Uuid::new_v4();
+        self.pending_side_start = Some(PendingSideStart {
+            request_id,
+            side_state: SideThreadState::new(parent_thread_id),
+            user_message,
+        });
 
         self.session_telemetry.counter(
             "codex.thread.side",
@@ -671,12 +811,6 @@ impl App {
         self.refresh_in_memory_config_from_disk_best_effort("starting a side conversation")
             .await;
 
-        let request_id = Uuid::new_v4();
-        self.pending_side_start = Some(PendingSideStart {
-            request_id,
-            side_state: SideThreadState::new(parent_thread_id),
-            user_message,
-        });
         let request_handle = app_server.request_handle();
         let thread_params_mode = app_server.thread_params_mode();
         let remote_cwd_override = app_server.remote_cwd_override().map(Path::to_path_buf);
@@ -708,8 +842,9 @@ impl App {
     ) -> Result<()> {
         let result_thread_id = match &result {
             Ok(session) => Some(session.thread_id),
-            Err(err) => err.thread_id,
+            Err(err) => err.session.as_ref().map(|session| session.thread_id),
         };
+        self.canceled_side_start_parents.remove(&request_id);
         let Some(PendingSideStart {
             side_state,
             mut user_message,
@@ -719,6 +854,15 @@ impl App {
             .take_if(|pending| pending.request_id == request_id)
         else {
             if let Some(thread_id) = result_thread_id {
+                let session = match &result {
+                    Ok(session) => Some(session),
+                    Err(err) => err.session.as_ref(),
+                };
+                if let Some(session) = session {
+                    let channel = self.ensure_thread_channel(thread_id);
+                    let mut store = channel.store.lock().await;
+                    Self::install_side_thread_snapshot(&mut store, session.clone(), Vec::new());
+                }
                 self.discard_side_thread_in_background(app_server, thread_id)
                     .await;
             }
@@ -728,18 +872,30 @@ impl App {
 
         if self.current_displayed_thread_id() != Some(parent_thread_id) {
             if let Some(thread_id) = result_thread_id {
+                let channel = self.ensure_thread_channel(thread_id);
+                let session = match &result {
+                    Ok(session) => Some(session),
+                    Err(err) => err.session.as_ref(),
+                };
+                if let Some(session) = session {
+                    let mut store = channel.store.lock().await;
+                    Self::install_side_thread_snapshot(&mut store, session.clone(), Vec::new());
+                }
+                if result.is_ok() {
+                    self.side_threads.insert(thread_id, side_state);
+                }
                 self.discard_side_thread_in_background(app_server, thread_id)
                     .await;
             }
-            self.restore_side_user_message(user_message.take());
-            self.chat_widget
-                .set_side_conversation_context_label(/*label*/ None);
+            self.restore_side_user_message_for_thread(parent_thread_id, user_message.take())
+                .await;
             return Ok(());
         }
 
         match result {
             Ok(session) => {
                 let child_thread_id = session.thread_id;
+                self.pending_side_threads.remove(&child_thread_id);
                 let channel = self.ensure_thread_channel(child_thread_id);
                 {
                     let mut store = channel.store.lock().await;
@@ -768,7 +924,11 @@ impl App {
                              {restore_err}"
                         );
                     }
-                    self.restore_side_user_message(user_message.take());
+                    self.restore_side_user_message_for_thread(
+                        parent_thread_id,
+                        user_message.take(),
+                    )
+                    .await;
                     self.chat_widget.add_error_message(format!(
                         "Failed to switch into side conversation {child_thread_id}: {err}"
                     ));
@@ -783,15 +943,26 @@ impl App {
                 } else {
                     self.discard_side_thread_in_background(app_server, child_thread_id)
                         .await;
-                    self.restore_side_user_message(user_message.take());
+                    self.restore_side_user_message_for_thread(
+                        parent_thread_id,
+                        user_message.take(),
+                    )
+                    .await;
                 }
             }
             Err(err) => {
-                if let Some(thread_id) = err.thread_id {
+                if let Some(session) = err.session {
+                    let thread_id = session.thread_id;
+                    let channel = self.ensure_thread_channel(thread_id);
+                    {
+                        let mut store = channel.store.lock().await;
+                        Self::install_side_thread_snapshot(&mut store, session, Vec::new());
+                    }
                     self.discard_side_thread_in_background(app_server, thread_id)
                         .await;
                 }
-                self.restore_side_user_message(user_message.take());
+                self.restore_side_user_message_for_thread(parent_thread_id, user_message.take())
+                    .await;
                 self.chat_widget
                     .set_side_conversation_context_label(/*label*/ None);
                 self.chat_widget

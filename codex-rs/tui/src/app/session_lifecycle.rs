@@ -590,12 +590,15 @@ impl App {
         Ok(())
     }
 
-    pub(super) fn reset_thread_event_state(&mut self) {
+    pub(super) fn reset_thread_event_state(&mut self) -> Option<crate::chatwidget::UserMessage> {
+        let pending_side_user_message = self.cancel_pending_side_start_for_session_reset();
+        for recovery_state in self.side_cleanup_recovery.values_mut() {
+            *recovery_state = None;
+        }
         self.abort_all_thread_event_listeners();
         self.thread_event_channels.clear();
         self.agent_navigation.clear();
         self.side_threads.clear();
-        self.pending_side_start = None;
         self.active_thread_id = None;
         self.active_thread_rx = None;
         self.primary_thread_id = None;
@@ -606,6 +609,7 @@ impl App {
         self.pending_startup_thread_start = false;
         self.chat_widget.set_pending_thread_approvals(Vec::new());
         self.sync_active_agent_label();
+        pending_side_user_message
     }
 
     pub(super) async fn handle_startup_thread_started(
@@ -753,7 +757,7 @@ impl App {
         // Initial messages are for freshly attached primary threads only. Thread switches and
         // resume/fork flows pass `None` so they cannot replay old history and then auto-submit a new
         // user turn by accident.
-        self.reset_thread_event_state();
+        let pending_side_user_message = self.reset_thread_event_state();
         let init = self.chatwidget_init_for_forked_or_resumed_thread(
             tui,
             self.config.clone(),
@@ -765,13 +769,15 @@ impl App {
         if started.blocks_direct_input {
             self.mark_primary_thread_parent_owned(started.session.thread_id);
         }
-        self.enqueue_primary_thread_session_with_presentation(
-            started.session,
-            started.turns,
-            presentation,
-        )
-        .await?;
-        Ok(())
+        let result = self
+            .enqueue_primary_thread_session_with_presentation(
+                started.session,
+                started.turns,
+                presentation,
+            )
+            .await;
+        self.restore_side_user_message(pending_side_user_message);
+        result
     }
 
     /// Fetches all loaded threads from the app server and registers descendants of the primary

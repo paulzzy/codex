@@ -973,6 +973,7 @@ impl App {
             self.apply_thread_settings_to_cached_session(thread_id, &notification.thread_settings)
                 .await;
         }
+        self.note_pending_side_thread_started(thread_id, &notification);
         let inferred_session = self
             .infer_session_for_thread_notification(thread_id, &notification)
             .await;
@@ -1109,12 +1110,14 @@ impl App {
         }
         session.message_history = None;
         session.rollout_path = rollout_path;
-        self.upsert_agent_picker_thread(
-            thread_id,
-            notification.thread.agent_nickname.clone(),
-            notification.thread.agent_role.clone(),
-            /*is_closed*/ false,
-        );
+        if !self.pending_side_threads.contains(&thread_id) {
+            self.upsert_agent_picker_thread(
+                thread_id,
+                notification.thread.agent_nickname.clone(),
+                notification.thread.agent_role.clone(),
+                /*is_closed*/ false,
+            );
+        }
         Some(session)
     }
 

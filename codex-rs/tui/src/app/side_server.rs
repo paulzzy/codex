@@ -14,7 +14,7 @@ pub(super) async fn prepare_side_thread(
 ) -> std::result::Result<ThreadSessionState, SideThreadPrepareError> {
     let boundary_item = serde_json::to_value(App::side_boundary_prompt_item()).map_err(|err| {
         SideThreadPrepareError {
-            thread_id: None,
+            session: None,
             error: color_eyre::eyre::eyre!("failed to encode thread/inject_items payload: {err}"),
         }
     })?;
@@ -27,7 +27,7 @@ pub(super) async fn prepare_side_thread(
     )
     .await
     .map_err(|err| SideThreadPrepareError {
-        thread_id: None,
+        session: None,
         error: err,
     })?;
     let child_thread_id = started.session.thread_id;
@@ -45,7 +45,7 @@ pub(super) async fn prepare_side_thread(
         .await;
     if let Err(err) = inject_result {
         return Err(SideThreadPrepareError {
-            thread_id: Some(child_thread_id),
+            session: Some(started.session),
             error: color_eyre::eyre::eyre!(
                 "thread/inject_items failed during TUI side conversation setup: {err}"
             ),

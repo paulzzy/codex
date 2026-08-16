@@ -65,7 +65,7 @@ use crate::history_cell::HistoryCell;
 
 #[derive(Debug)]
 pub(crate) struct SideThreadPrepareError {
-    pub(crate) thread_id: Option<ThreadId>,
+    pub(crate) session: Option<ThreadSessionState>,
     pub(crate) error: color_eyre::Report,
 }
 
@@ -220,6 +220,11 @@ pub(crate) enum AppEvent {
     },
     /// Finish preparing a transient side conversation off the TUI event loop.
     SideThreadPrepared(Uuid, Result<ThreadSessionState, SideThreadPrepareError>),
+    /// Finish removing an abandoned side conversation off the TUI event loop.
+    SideThreadCleanupFinished {
+        thread_id: ThreadId,
+        result: Result<(), String>,
+    },
 
     /// Submit an op to the specified thread, regardless of current focus.
     SubmitThreadOp {

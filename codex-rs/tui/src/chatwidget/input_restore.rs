@@ -366,13 +366,53 @@ impl ChatWidget {
 
     pub(crate) fn restore_user_message_to_composer(&mut self, user_message: UserMessage) {
         let draft = self.bottom_pane.composer_draft_snapshot();
-        let pending_pastes = draft.pending_pastes;
-        let draft_message = UserMessage {
+        let composer = ThreadComposerState {
             text: draft.text,
-            text_elements: draft.text_elements,
             local_images: draft.local_images,
             remote_image_urls: draft.remote_image_urls,
+            text_elements: draft.text_elements,
             mention_bindings: draft.mention_bindings,
+            pending_pastes: draft.pending_pastes,
+        };
+        self.restore_composer_state(Self::composer_state_with_restored_user_message(
+            user_message,
+            composer,
+        ));
+    }
+
+    pub(crate) fn restore_user_message_to_thread_input_state(
+        input_state: &mut Option<ThreadInputState>,
+        user_message: UserMessage,
+    ) -> bool {
+        let Some(input_state) = input_state.as_mut() else {
+            return false;
+        };
+        let composer = input_state.composer.take().unwrap_or_default();
+        input_state.composer = Some(Self::composer_state_with_restored_user_message(
+            user_message,
+            composer,
+        ));
+        true
+    }
+
+    fn composer_state_with_restored_user_message(
+        user_message: UserMessage,
+        composer: ThreadComposerState,
+    ) -> ThreadComposerState {
+        let ThreadComposerState {
+            text,
+            local_images,
+            remote_image_urls,
+            text_elements,
+            mention_bindings,
+            pending_pastes,
+        } = composer;
+        let draft_message = UserMessage {
+            text,
+            local_images,
+            remote_image_urls,
+            text_elements,
+            mention_bindings,
         };
         let mut messages = vec![user_message];
         if !draft_message.text.is_empty()
@@ -381,10 +421,7 @@ impl ChatWidget {
         {
             messages.push(draft_message);
         }
-        self.restore_composer_state(Self::composer_state_from_user_message(
-            merge_user_messages(messages),
-            pending_pastes,
-        ));
+        Self::composer_state_from_user_message(merge_user_messages(messages), pending_pastes)
     }
 
     pub(super) fn restore_composer_state(&mut self, composer: ThreadComposerState) {

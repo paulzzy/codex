@@ -31,6 +31,7 @@ use crate::app_event::HistoryBatchEntryResponse;
 use codex_utils_absolute_path::test_support::PathExt;
 
 use crate::chatwidget::ChatWidgetInit;
+use crate::chatwidget::ThreadInputStateRestoreMode;
 use crate::chatwidget::create_initial_user_message;
 use crate::chatwidget::tests::helpers::render_bottom_popup;
 use crate::chatwidget::tests::helpers::set_active_cell;
@@ -597,13 +598,35 @@ async fn reset_thread_event_state_aborts_listener_tasks() {
         std::future::pending::<()>().await;
     });
     app.thread_event_listener_tasks.insert(thread_id, handle);
+    let pending_request_id = Uuid::new_v4();
+    let pending_parent_thread_id = ThreadId::new();
+    app.pending_side_start = Some(PendingSideStart {
+        request_id: pending_request_id,
+        side_state: SideThreadState::new(pending_parent_thread_id),
+        user_message: Some(crate::chatwidget::UserMessage::from(
+            "pending side question",
+        )),
+    });
     started_rx
         .await
         .expect("listener task should report it started");
 
-    app.reset_thread_event_state();
+    let restored_user_message = app.reset_thread_event_state();
 
     assert_eq!(app.thread_event_listener_tasks.is_empty(), true);
+    assert_eq!(
+        restored_user_message,
+        Some(crate::chatwidget::UserMessage::from(
+            "pending side question"
+        ))
+    );
+    assert_eq!(app.pending_side_start.is_none(), true);
+    assert_eq!(
+        app.canceled_side_start_parents
+            .get(&pending_request_id)
+            .copied(),
+        Some(pending_parent_thread_id)
+    );
     time::timeout(Duration::from_millis(50), dropped_rx)
         .await
         .expect("timed out waiting for listener task abort")
@@ -2333,6 +2356,106 @@ async fn stale_side_preparation_result_does_not_consume_newer_request() -> Resul
 }
 
 #[tokio::test]
+async fn side_completion_after_thread_switch_restores_only_the_parent_draft() -> Result<()> {
+    let mut app = make_test_app().await;
+    let mut app_server =
+        crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
+    let parent_thread_id = ThreadId::new();
+    let visible_thread_id = ThreadId::new();
+    let request_id = Uuid::new_v4();
+    let parent_channel = ThreadEventChannel::new(/*capacity*/ 4);
+    {
+        let mut store = parent_channel.store.lock().await;
+        store.input_state = app.chat_widget.capture_thread_input_state();
+    }
+    app.thread_event_channels
+        .insert(parent_thread_id, parent_channel);
+    app.active_thread_id = Some(visible_thread_id);
+    app.chat_widget
+        .restore_user_message_to_composer("visible thread draft".into());
+    app.pending_side_start = Some(PendingSideStart {
+        request_id,
+        side_state: SideThreadState::new(parent_thread_id),
+        user_message: Some(crate::chatwidget::UserMessage::from("side question")),
+    });
+    let mut side_config = app.chat_widget.config_ref().clone();
+    side_config.ephemeral = true;
+    let side = app_server.start_thread(&side_config).await?;
+    let side_thread_id = side.session.thread_id;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+
+    app.handle_side_thread_prepared(&mut tui, &mut app_server, request_id, Ok(side.session))
+        .await?;
+
+    assert_eq!(
+        app.chat_widget.composer_text_with_pending(),
+        "visible thread draft"
+    );
+    let parent_input_state = app
+        .thread_event_channels
+        .get(&parent_thread_id)
+        .expect("parent thread channel")
+        .store
+        .lock()
+        .await
+        .snapshot()
+        .input_state;
+    app.chat_widget.restore_thread_input_state(
+        parent_input_state,
+        ThreadInputStateRestoreMode {
+            preserve_in_flight_turn: false,
+        },
+    );
+    assert_eq!(
+        app.chat_widget.composer_text_with_pending(),
+        "side question"
+    );
+    assert!(app.abandoned_side_threads.contains(&side_thread_id));
+    app_server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_replacement_restores_pending_side_question_as_a_draft() -> Result<()> {
+    let mut app = make_test_app().await;
+    let mut app_server =
+        crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
+    let started = app_server
+        .start_thread(app.chat_widget.config_ref())
+        .await?;
+    let pending_request_id = Uuid::new_v4();
+    let pending_parent_thread_id = ThreadId::new();
+    app.pending_side_start = Some(PendingSideStart {
+        request_id: pending_request_id,
+        side_state: SideThreadState::new(pending_parent_thread_id),
+        user_message: Some(crate::chatwidget::UserMessage::from("carry this draft")),
+    });
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+
+    app.replace_chat_widget_with_app_server_thread(
+        &mut tui,
+        started,
+        crate::app::session_lifecycle::ThreadAttachPresentation::SessionLineage,
+        /*initial_user_message*/ None,
+    )
+    .await?;
+
+    assert_eq!(
+        app.chat_widget.composer_text_with_pending(),
+        "carry this draft"
+    );
+    assert_eq!(app.pending_side_start.is_none(), true);
+    assert_eq!(
+        app.canceled_side_start_parents
+            .get(&pending_request_id)
+            .copied(),
+        Some(pending_parent_thread_id)
+    );
+    app_server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn select_uncached_agent_thread_still_refreshes_liveness() -> Result<()> {
     let mut app = Box::pin(make_test_app()).await;
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
@@ -3603,6 +3726,71 @@ async fn inactive_thread_approval_badge_clears_after_turn_completion_notificatio
 }
 
 #[tokio::test]
+async fn pending_side_thread_started_is_hidden_from_agent_navigation() -> Result<()> {
+    let mut app = make_test_app().await;
+    let parent_thread_id = ThreadId::new();
+    let child_thread_id = ThreadId::new();
+    let primary_session = test_thread_session(parent_thread_id, test_path_buf("/tmp/main"));
+    app.primary_thread_id = Some(parent_thread_id);
+    app.active_thread_id = Some(parent_thread_id);
+    app.primary_session_configured = Some(primary_session);
+    app.pending_side_start = Some(PendingSideStart {
+        request_id: Uuid::new_v4(),
+        side_state: SideThreadState::new(parent_thread_id),
+        user_message: Some(crate::chatwidget::UserMessage::from("side question")),
+    });
+
+    app.enqueue_thread_notification(
+        child_thread_id,
+        ServerNotification::ThreadStarted(ThreadStartedNotification {
+            thread: Thread {
+                id: child_thread_id.to_string(),
+                extra: None,
+                session_id: child_thread_id.to_string(),
+                forked_from_id: Some(parent_thread_id.to_string()),
+                parent_thread_id: None,
+                preview: String::new(),
+                ephemeral: true,
+                section: None,
+                section_entered_at: None,
+                history_mode: Default::default(),
+                model_provider: "test-provider".to_string(),
+                created_at: 1,
+                updated_at: 1,
+                recency_at: Some(1),
+                status: codex_app_server_protocol::ThreadStatus::Idle,
+                path: None,
+                cwd: test_path_buf("/tmp/main").abs(),
+                cli_version: "0.0.0".to_string(),
+                source: codex_app_server_protocol::SessionSource::Unknown,
+                can_accept_direct_input: None,
+                thread_source: None,
+                agent_nickname: None,
+                agent_role: None,
+                git_info: None,
+                name: None,
+                turns: Vec::new(),
+            },
+        }),
+    )
+    .await?;
+
+    assert!(app.pending_side_threads.contains(&child_thread_id));
+    assert_eq!(app.agent_navigation.get(&child_thread_id), None);
+    assert!(
+        app.thread_event_channels
+            .get(&child_thread_id)
+            .expect("pending side channel")
+            .store
+            .lock()
+            .await
+            .session
+            .is_some()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn inactive_thread_started_notification_initializes_replay_session() -> Result<()> {
     let mut app = make_test_app().await;
     let temp_dir = tempdir()?;
@@ -4006,7 +4194,7 @@ async fn side_fork_config_inherits_parent_thread_runtime_settings() {
 }
 
 #[tokio::test]
-async fn side_start_block_message_allows_replacing_open_side_conversation() {
+async fn side_start_block_message_requires_closing_existing_side_conversation() {
     let mut app = make_test_app().await;
     assert_eq!(
         app.side_start_block_message(),
@@ -4022,7 +4210,12 @@ async fn side_start_block_message_allows_replacing_open_side_conversation() {
         .insert(side_thread_id, SideThreadState::new(parent_thread_id));
 
     app.active_thread_id = Some(parent_thread_id);
-    assert_eq!(app.side_start_block_message(), None);
+    assert_eq!(
+        app.side_start_block_message(),
+        Some(
+            "A side conversation is already open. Press ctrl + c to return before starting another."
+        )
+    );
 
     app.active_thread_id = Some(side_thread_id);
     assert_eq!(
@@ -4032,7 +4225,16 @@ async fn side_start_block_message_allows_replacing_open_side_conversation() {
         )
     );
 
+    app.side_cleanup_recovery
+        .insert(side_thread_id, Some(SideThreadState::new(parent_thread_id)));
     app.side_threads.remove(&side_thread_id);
+    assert_eq!(
+        app.side_start_block_message(),
+        Some(
+            "A side conversation is already open. Press ctrl + c to return before starting another."
+        )
+    );
+    app.side_cleanup_recovery.remove(&side_thread_id);
     assert_eq!(app.side_start_block_message(), None);
 }
 
@@ -4477,6 +4679,52 @@ async fn side_restore_user_message_puts_inline_question_back_in_composer() {
 }
 
 #[tokio::test]
+async fn side_restore_user_message_targets_the_inactive_parent_thread() {
+    let mut app = make_test_app().await;
+    let parent_thread_id = ThreadId::new();
+    let visible_thread_id = ThreadId::new();
+    let channel = ThreadEventChannel::new(/*capacity*/ 4);
+    {
+        let mut store = channel.store.lock().await;
+        store.input_state = app.chat_widget.capture_thread_input_state();
+    }
+    app.thread_event_channels.insert(parent_thread_id, channel);
+    app.active_thread_id = Some(visible_thread_id);
+    app.chat_widget
+        .restore_user_message_to_composer("visible thread draft".into());
+
+    app.restore_side_user_message_for_thread(
+        parent_thread_id,
+        Some(crate::chatwidget::UserMessage::from("side question")),
+    )
+    .await;
+
+    assert_eq!(
+        app.chat_widget.composer_text_with_pending(),
+        "visible thread draft"
+    );
+    let parent_input_state = app
+        .thread_event_channels
+        .get(&parent_thread_id)
+        .expect("parent thread channel")
+        .store
+        .lock()
+        .await
+        .snapshot()
+        .input_state;
+    app.chat_widget.restore_thread_input_state(
+        parent_input_state,
+        ThreadInputStateRestoreMode {
+            preserve_in_flight_turn: false,
+        },
+    );
+    assert_eq!(
+        app.chat_widget.composer_text_with_pending(),
+        "side question"
+    );
+}
+
+#[tokio::test]
 async fn side_discard_selection_keeps_current_side_thread() {
     let mut app = make_test_app().await;
     let parent_thread_id = ThreadId::new();
@@ -4595,7 +4843,7 @@ async fn background_side_cleanup_removes_local_state_and_ignores_late_events() -
 
     assert_eq!(app.active_thread_id, Some(parent_thread_id));
     assert!(!app.side_threads.contains_key(&side_thread_id));
-    assert!(!app.thread_event_channels.contains_key(&side_thread_id));
+    assert!(app.thread_event_channels.contains_key(&side_thread_id));
     assert_eq!(app.agent_navigation.get(&side_thread_id), None);
     assert!(app.abandoned_side_threads.contains(&side_thread_id));
 
@@ -4604,7 +4852,7 @@ async fn background_side_cleanup_removes_local_state_and_ignores_late_events() -
         agent_message_delta_notification(side_thread_id, "turn-1", "item-1", "late"),
     )
     .await?;
-    assert!(!app.thread_event_channels.contains_key(&side_thread_id));
+    assert!(app.thread_event_channels.contains_key(&side_thread_id));
 
     app.handle_app_server_event(
         &app_server,
@@ -4625,7 +4873,81 @@ async fn background_side_cleanup_removes_local_state_and_ignores_late_events() -
         })
         .expect("approval resolution should serialize");
     assert_eq!(resolution, None);
+
+    app.handle_side_thread_cleanup_finished(side_thread_id, Ok(()))
+        .await;
+
+    assert!(!app.thread_event_channels.contains_key(&side_thread_id));
+    assert_eq!(app.agent_navigation.get(&side_thread_id), None);
     Ok(())
+}
+
+#[tokio::test]
+async fn background_side_cleanup_failure_restores_local_navigation() -> Result<()> {
+    let mut app = make_test_app().await;
+    let mut app_server =
+        crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
+    let parent_thread_id = ThreadId::new();
+    let side_thread_id = ThreadId::new();
+    app.active_thread_id = Some(parent_thread_id);
+    app.side_threads
+        .insert(side_thread_id, SideThreadState::new(parent_thread_id));
+    app.thread_event_channels
+        .insert(side_thread_id, ThreadEventChannel::new(/*capacity*/ 4));
+    app.agent_navigation.upsert(
+        side_thread_id,
+        Some("Side".to_string()),
+        Some("side".to_string()),
+        /*is_closed*/ false,
+    );
+
+    app.discard_side_thread_in_background(&mut app_server, side_thread_id)
+        .await;
+    app.handle_side_thread_cleanup_finished(
+        side_thread_id,
+        Err("transport disconnected".to_string()),
+    )
+    .await;
+
+    assert!(!app.abandoned_side_threads.contains(&side_thread_id));
+    assert_eq!(
+        app.side_threads
+            .get(&side_thread_id)
+            .map(|state| state.parent_thread_id),
+        Some(parent_thread_id)
+    );
+    assert!(app.thread_event_channels.contains_key(&side_thread_id));
+    assert!(app.agent_navigation.get(&side_thread_id).is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_cleanup_failure_after_session_reset_stays_hidden() {
+    let mut app = make_test_app().await;
+    let side_thread_id = ThreadId::new();
+    app.abandoned_side_threads.insert(side_thread_id);
+    app.side_cleanup_recovery.insert(side_thread_id, None);
+    app.thread_event_channels
+        .insert(side_thread_id, ThreadEventChannel::new(/*capacity*/ 4));
+
+    app.handle_side_thread_cleanup_finished(
+        side_thread_id,
+        Err("transport disconnected".to_string()),
+    )
+    .await;
+
+    assert!(app.abandoned_side_threads.contains(&side_thread_id));
+    assert_eq!(app.agent_navigation.get(&side_thread_id), None);
+    assert!(!app.side_threads.contains_key(&side_thread_id));
+    assert!(!app.thread_event_channels.contains_key(&side_thread_id));
+
+    app.handle_side_thread_cleanup_finished(
+        side_thread_id,
+        Err("duplicate stale result".to_string()),
+    )
+    .await;
+    assert!(app.abandoned_side_threads.contains(&side_thread_id));
+    assert_eq!(app.agent_navigation.get(&side_thread_id), None);
 }
 
 #[tokio::test]
@@ -4958,6 +5280,9 @@ async fn make_test_app() -> App {
         agent_navigation: AgentNavigationState::default(),
         side_threads: HashMap::new(),
         abandoned_side_threads: HashSet::new(),
+        pending_side_threads: HashSet::new(),
+        side_cleanup_recovery: HashMap::new(),
+        canceled_side_start_parents: HashMap::new(),
         pending_side_start: None,
         active_thread_id: None,
         active_thread_rx: None,
@@ -5035,6 +5360,9 @@ async fn make_test_app_with_channels() -> (
             agent_navigation: AgentNavigationState::default(),
             side_threads: HashMap::new(),
             abandoned_side_threads: HashSet::new(),
+            pending_side_threads: HashSet::new(),
+            side_cleanup_recovery: HashMap::new(),
+            canceled_side_start_parents: HashMap::new(),
             pending_side_start: None,
             active_thread_id: None,
             active_thread_rx: None,
