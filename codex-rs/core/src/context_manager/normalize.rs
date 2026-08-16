@@ -5,7 +5,7 @@ use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::InputModality;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::util::error_or_panic;
@@ -18,39 +18,61 @@ const AUDIO_CONTENT_OMITTED_PLACEHOLDER: &str =
 // Changing this value would change model-visible IDs and invalidate prompt caches.
 const SYNTHETIC_OUTPUT_ID_NAMESPACE: Uuid = Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
 
+#[derive(Clone, Copy)]
+enum MissingOutputDiagnostics {
+    Report,
+    Suppress,
+}
+
+pub(crate) fn missing_call_outputs_for_interrupted_turn(
+    items: &[ResponseItemEnvelope],
+) -> Vec<(usize, ResponseItemEnvelope)> {
+    collect_missing_call_outputs(items, MissingOutputDiagnostics::Suppress)
+}
+
 pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItemEnvelope>) {
-    let mut function_output_ids = HashSet::new();
-    let mut tool_search_output_ids = HashSet::new();
-    let mut custom_tool_output_ids = HashSet::new();
-    for envelope in items.iter() {
+    let missing_outputs_to_insert =
+        collect_missing_call_outputs(items, MissingOutputDiagnostics::Report);
+    for (idx, output_item) in missing_outputs_to_insert.into_iter().rev() {
+        items.insert(idx + 1, output_item);
+    }
+}
+
+fn collect_missing_call_outputs(
+    items: &[ResponseItemEnvelope],
+    diagnostics: MissingOutputDiagnostics,
+) -> Vec<(usize, ResponseItemEnvelope)> {
+    let mut function_outputs = HashMap::<String, usize>::new();
+    let mut tool_search_outputs = HashMap::<(String, String), usize>::new();
+    let mut custom_tool_outputs = HashMap::<String, usize>::new();
+    let mut missing_outputs_to_insert: Vec<(usize, ResponseItemEnvelope)> = Vec::new();
+
+    // Walk backward so only a later compatible output can satisfy a call. Counts make pairing
+    // one-to-one when malformed histories reuse call IDs or contain duplicate calls.
+    for (idx, envelope) in items.iter().enumerate().rev() {
         match &envelope.item {
             ResponseItem::FunctionCallOutput { call_id, .. } => {
-                function_output_ids.insert(call_id.as_str());
+                *function_outputs.entry(call_id.clone()).or_default() += 1;
             }
             ResponseItem::ToolSearchOutput {
                 call_id: Some(call_id),
+                execution,
                 ..
             } => {
-                tool_search_output_ids.insert(call_id.as_str());
+                *tool_search_outputs
+                    .entry((execution.clone(), call_id.clone()))
+                    .or_default() += 1;
             }
             ResponseItem::CustomToolCallOutput { call_id, .. } => {
-                custom_tool_output_ids.insert(call_id.as_str());
+                *custom_tool_outputs.entry(call_id.clone()).or_default() += 1;
             }
-            _ => {}
-        }
-    }
-
-    // Collect synthetic outputs to insert immediately after their calls.
-    // Store the insertion position (index of call) alongside the item so
-    // we can insert in reverse order and avoid index shifting.
-    let mut missing_outputs_to_insert: Vec<(usize, ResponseItemEnvelope)> = Vec::new();
-
-    for (idx, envelope) in items.iter().enumerate() {
-        match &envelope.item {
-            ResponseItem::FunctionCall { id, call_id, .. }
-                if !function_output_ids.contains(call_id.as_str()) =>
-            {
-                info!("Function call output is missing for call id: {call_id}");
+            ResponseItem::FunctionCall { id, call_id, .. } => {
+                if consume_later_output(&mut function_outputs, call_id) {
+                    continue;
+                }
+                if matches!(diagnostics, MissingOutputDiagnostics::Report) {
+                    info!("Function call output is missing for call id: {call_id}");
+                }
                 missing_outputs_to_insert.push((
                     idx,
                     ResponseItemEnvelope::new(ResponseItem::FunctionCallOutput {
@@ -64,27 +86,36 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItemEnvelope>)
             ResponseItem::ToolSearchCall {
                 id,
                 call_id: Some(call_id),
+                execution,
                 ..
-            } if !tool_search_output_ids.contains(call_id.as_str()) => {
-                info!("Tool search output is missing for call id: {call_id}");
+            } => {
+                if consume_tool_search_output(&mut tool_search_outputs, execution, call_id) {
+                    continue;
+                }
+                if matches!(diagnostics, MissingOutputDiagnostics::Report) {
+                    info!("Tool search output is missing for call id: {call_id}");
+                }
                 missing_outputs_to_insert.push((
                     idx,
                     ResponseItemEnvelope::new(ResponseItem::ToolSearchOutput {
                         id: synthetic_output_id("tso", id.as_deref()),
                         call_id: Some(call_id.clone()),
                         status: "completed".to_string(),
-                        execution: "client".to_string(),
+                        execution: execution.clone(),
                         tools: Vec::new(),
                         internal_chat_message_metadata_passthrough: None,
                     }),
                 ));
             }
-            ResponseItem::CustomToolCall { id, call_id, .. }
-                if !custom_tool_output_ids.contains(call_id.as_str()) =>
-            {
-                error_or_panic(format!(
-                    "Custom tool call output is missing for call id: {call_id}"
-                ));
+            ResponseItem::CustomToolCall { id, call_id, .. } => {
+                if consume_later_output(&mut custom_tool_outputs, call_id) {
+                    continue;
+                }
+                if matches!(diagnostics, MissingOutputDiagnostics::Report) {
+                    error_or_panic(format!(
+                        "Custom tool call output is missing for call id: {call_id}"
+                    ));
+                }
                 missing_outputs_to_insert.push((
                     idx,
                     ResponseItemEnvelope::new(ResponseItem::CustomToolCallOutput {
@@ -101,10 +132,15 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItemEnvelope>)
                 id,
                 call_id: Some(call_id),
                 ..
-            } if !function_output_ids.contains(call_id.as_str()) => {
-                error_or_panic(format!(
-                    "Local shell call output is missing for call id: {call_id}"
-                ));
+            } => {
+                if consume_later_output(&mut function_outputs, call_id) {
+                    continue;
+                }
+                if matches!(diagnostics, MissingOutputDiagnostics::Report) {
+                    error_or_panic(format!(
+                        "Local shell call output is missing for call id: {call_id}"
+                    ));
+                }
                 missing_outputs_to_insert.push((
                     idx,
                     ResponseItemEnvelope::new(ResponseItem::FunctionCallOutput {
@@ -118,16 +154,35 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItemEnvelope>)
             _ => {}
         }
     }
-    drop((
-        function_output_ids,
-        tool_search_output_ids,
-        custom_tool_output_ids,
-    ));
+    missing_outputs_to_insert.sort_by_key(|(idx, _)| *idx);
+    missing_outputs_to_insert
+}
 
-    // Insert synthetic outputs in reverse index order to avoid re-indexing.
-    for (idx, output_item) in missing_outputs_to_insert.into_iter().rev() {
-        items.insert(idx + 1, output_item);
+fn consume_later_output(outputs: &mut HashMap<String, usize>, call_id: &str) -> bool {
+    let Some(count) = outputs.get_mut(call_id) else {
+        return false;
+    };
+    *count -= 1;
+    if *count == 0 {
+        outputs.remove(call_id);
     }
+    true
+}
+
+fn consume_tool_search_output(
+    outputs: &mut HashMap<(String, String), usize>,
+    execution: &str,
+    call_id: &str,
+) -> bool {
+    let key = (execution.to_string(), call_id.to_string());
+    let Some(count) = outputs.get_mut(&key) else {
+        return false;
+    };
+    *count -= 1;
+    if *count == 0 {
+        outputs.remove(&key);
+    }
+    true
 }
 
 /// Derives a stable ID for a prompt-only output from its source call's item ID.
@@ -146,57 +201,56 @@ fn synthetic_output_id(prefix: &str, item_id: Option<&str>) -> Option<ResponseIt
 }
 
 pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItemEnvelope>) {
-    let mut function_call_ids = HashSet::new();
-    let mut tool_search_call_ids = HashSet::new();
-    let mut custom_tool_call_ids = HashSet::new();
-    for envelope in items.iter() {
+    let mut function_calls = HashMap::<String, usize>::new();
+    let mut tool_search_calls = HashMap::<(String, String), usize>::new();
+    let mut custom_tool_calls = HashMap::<String, usize>::new();
+    let mut orphan_positions = Vec::new();
+    for (position, envelope) in items.iter().enumerate() {
         match &envelope.item {
             ResponseItem::FunctionCall { call_id, .. }
             | ResponseItem::LocalShellCall {
                 call_id: Some(call_id),
                 ..
             } => {
-                function_call_ids.insert(call_id.as_str());
+                *function_calls.entry(call_id.clone()).or_default() += 1;
             }
             ResponseItem::ToolSearchCall {
                 call_id: Some(call_id),
+                execution,
                 ..
             } => {
-                tool_search_call_ids.insert(call_id.as_str());
+                *tool_search_calls
+                    .entry((execution.clone(), call_id.clone()))
+                    .or_default() += 1;
             }
             ResponseItem::CustomToolCall { call_id, .. } => {
-                custom_tool_call_ids.insert(call_id.as_str());
+                *custom_tool_calls.entry(call_id.clone()).or_default() += 1;
             }
-            _ => {}
-        }
-    }
-
-    let mut orphan_positions = Vec::new();
-    for (position, envelope) in items.iter().enumerate() {
-        match &envelope.item {
-            ResponseItem::FunctionCallOutput { call_id, .. }
-                if !function_call_ids.contains(call_id.as_str()) =>
-            {
-                error_or_panic(format!(
-                    "Orphan function call output for call id: {call_id}"
-                ));
-                orphan_positions.push(position);
+            ResponseItem::FunctionCallOutput { call_id, .. } => {
+                if !consume_later_output(&mut function_calls, call_id) {
+                    error_or_panic(format!(
+                        "Orphan function call output for call id: {call_id}"
+                    ));
+                    orphan_positions.push(position);
+                }
             }
-            ResponseItem::CustomToolCallOutput { call_id, .. }
-                if !custom_tool_call_ids.contains(call_id.as_str()) =>
-            {
-                error_or_panic(format!(
-                    "Orphan custom tool call output for call id: {call_id}"
-                ));
-                orphan_positions.push(position);
+            ResponseItem::CustomToolCallOutput { call_id, .. } => {
+                if !consume_later_output(&mut custom_tool_calls, call_id) {
+                    error_or_panic(format!(
+                        "Orphan custom tool call output for call id: {call_id}"
+                    ));
+                    orphan_positions.push(position);
+                }
             }
             ResponseItem::ToolSearchOutput {
                 call_id: Some(call_id),
                 execution,
                 ..
-            } if execution != "server" && !tool_search_call_ids.contains(call_id.as_str()) => {
-                error_or_panic(format!("Orphan tool search output for call id: {call_id}"));
-                orphan_positions.push(position);
+            } if execution != "server" => {
+                if !consume_tool_search_output(&mut tool_search_calls, execution, call_id) {
+                    error_or_panic(format!("Orphan tool search output for call id: {call_id}"));
+                    orphan_positions.push(position);
+                }
             }
             _ => {}
         }

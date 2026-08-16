@@ -1435,6 +1435,22 @@ async fn assert_thread_fork_freezes_active_paginated_turn_as_interrupted(
         &completed_user_item("before-fork", /*completed_at_ms*/ 1),
     )
     .await?;
+    append_rollout_item_to_path(
+        source_path.as_path(),
+        &RolloutItem::ResponseItem(
+            ResponseItem::CustomToolCall {
+                id: None,
+                status: None,
+                call_id: "tool-1".to_string(),
+                name: "my_tool".to_string(),
+                namespace: None,
+                input: "{}".to_string(),
+                internal_chat_message_metadata_passthrough: None,
+            }
+            .into(),
+        ),
+    )
+    .await?;
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
@@ -1496,13 +1512,20 @@ async fn assert_thread_fork_freezes_active_paginated_turn_as_interrupted(
     assert!(matches!(
         child_rollout.as_slice(),
         [
-            RolloutLine { item: RolloutItem::SessionMeta(_), .. },
+            RolloutLine {
+                item: RolloutItem::SessionMeta(_),
+                ..
+            },
             RolloutLine {
                 item: RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_)),
                 ..
             },
             RolloutLine {
-                item: RolloutItem::ResponseItem(response_item),
+                item: RolloutItem::ResponseItem(tool_output),
+                ..
+            },
+            RolloutLine {
+                item: RolloutItem::ResponseItem(interrupt_marker),
                 ..
             },
             RolloutLine {
@@ -1510,9 +1533,11 @@ async fn assert_thread_fork_freezes_active_paginated_turn_as_interrupted(
                 ..
             },
         ] if matches!(
-            &response_item.item,
-            codex_protocol::models::ResponseItem::Message { role, .. }
-                if role == expected_marker_role
+            &tool_output.item,
+            ResponseItem::CustomToolCallOutput { call_id, .. } if call_id == "tool-1"
+        ) && matches!(
+            &interrupt_marker.item,
+            ResponseItem::Message { role, .. } if role == expected_marker_role
         ) && aborted.turn_id.as_deref() == Some("active-turn")
     ));
 
@@ -1565,6 +1590,8 @@ async fn assert_thread_fork_freezes_active_paginated_turn_as_interrupted(
     let serialized_input = serde_json::to_string(&input)?;
     assert!(serialized_input.contains("before-fork model input"));
     assert!(!serialized_input.contains("after-fork model input"));
+    assert!(serialized_input.contains("\"type\":\"custom_tool_call_output\""));
+    assert!(serialized_input.contains("aborted"));
     assert!(input.as_array().is_some_and(|items| {
         items.iter().any(|item| {
             item["role"] == expected_marker_role

@@ -1924,6 +1924,58 @@ fn normalize_adds_missing_output_for_tool_search_call() {
     );
 }
 
+#[test]
+fn server_tool_search_output_does_not_satisfy_client_call() {
+    let items = vec![
+        ResponseItem::ToolSearchCall {
+            id: None,
+            call_id: Some("search-call-x".to_string()),
+            status: Some("in_progress".to_string()),
+            execution: "client".to_string(),
+            arguments: "{}".into(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::ToolSearchOutput {
+            id: None,
+            call_id: Some("search-call-x".to_string()),
+            status: "completed".to_string(),
+            execution: "server".to_string(),
+            tools: Vec::new(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+    let mut history = create_history_with_items(items);
+
+    history.normalize_history(&default_input_modalities());
+
+    let normalized_items = raw_items(&history);
+    let [
+        ResponseItem::ToolSearchCall {
+            execution: call_execution,
+            ..
+        },
+        ResponseItem::ToolSearchOutput {
+            execution: synthetic_execution,
+            ..
+        },
+        ResponseItem::ToolSearchOutput {
+            execution: server_execution,
+            ..
+        },
+    ] = normalized_items.as_slice()
+    else {
+        panic!("expected client call, synthetic client output, then server output");
+    };
+    assert_eq!(
+        (
+            call_execution.as_str(),
+            synthetic_execution.as_str(),
+            server_execution.as_str()
+        ),
+        ("client", "client", "server")
+    );
+}
+
 #[cfg(debug_assertions)]
 #[test]
 #[should_panic]

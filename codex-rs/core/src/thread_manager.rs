@@ -2107,16 +2107,34 @@ fn snapshot_turn_state(history: &InitialHistory) -> SnapshotTurnState {
     // Synthetic fork/resume histories can contain user/assistant response items
     // without explicit turn lifecycle events. If the persisted snapshot has no
     // terminating boundary after its last user message, treat it as mid-turn.
-    SnapshotTurnState {
-        ends_mid_turn: !rollout_items[last_user_position + 1..].iter().any(|item| {
+    let ends_mid_turn = !rollout_items[last_user_position + 1..].iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::EventMsg(EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_))
+        )
+    });
+    let active_segment_start = rollout_items[..last_user_position]
+        .iter()
+        .rposition(|item| {
             matches!(
                 item,
-                RolloutItem::EventMsg(EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_))
+                RolloutItem::EventMsg(
+                    EventMsg::AgentMessage(_)
+                        | EventMsg::TurnComplete(_)
+                        | EventMsg::TurnAborted(_)
+                )
             )
-        }),
+        })
+        .map_or(0, |position| position + 1);
+    let has_legacy_user_event = rollout_items[active_segment_start..]
+        .iter()
+        .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::UserMessage(_))));
+    SnapshotTurnState {
+        ends_mid_turn,
         active_turn_id: None,
         active_turn_started_at: None,
-        active_turn_start_index: None,
+        active_turn_start_index: (ends_mid_turn && !has_legacy_user_event)
+            .then_some(last_user_position),
     }
 }
 
@@ -2140,6 +2158,10 @@ fn fork_history_from_snapshot(
                 }
             };
             if snapshot_state.ends_mid_turn {
+                let history = complete_interrupted_turn_call_outputs(
+                    history,
+                    snapshot_state.active_turn_start_index,
+                );
                 append_interrupted_boundary(
                     history,
                     snapshot_state.active_turn_id,
@@ -2151,6 +2173,45 @@ fn fork_history_from_snapshot(
             }
         }
     }
+}
+
+fn complete_interrupted_turn_call_outputs(
+    history: InitialHistory,
+    active_turn_start_index: Option<usize>,
+) -> InitialHistory {
+    let Some(active_turn_start_index) = active_turn_start_index else {
+        return history;
+    };
+    let InitialHistory::Forked(mut rollout_items) = history else {
+        return history;
+    };
+    let response_item_positions = rollout_items
+        .iter()
+        .enumerate()
+        .skip(active_turn_start_index)
+        .filter_map(|(rollout_index, item)| match item {
+            RolloutItem::ResponseItem(envelope) => Some((rollout_index, envelope.clone())),
+            RolloutItem::SessionMeta(_)
+            | RolloutItem::InterAgentCommunication(_)
+            | RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::Compacted(_)
+            | RolloutItem::TurnContext(_)
+            | RolloutItem::WorldState(_)
+            | RolloutItem::SecurityRiskScore(_)
+            | RolloutItem::EventMsg(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let response_items = response_item_positions
+        .iter()
+        .map(|(_, envelope)| envelope.clone())
+        .collect::<Vec<_>>();
+    let missing_outputs =
+        crate::context_manager::missing_call_outputs_for_interrupted_turn(&response_items);
+    for (response_index, output) in missing_outputs.into_iter().rev() {
+        let rollout_index = response_item_positions[response_index].0;
+        rollout_items.insert(rollout_index + 1, RolloutItem::ResponseItem(output));
+    }
+    InitialHistory::Forked(rollout_items)
 }
 
 /// Append the same persisted interrupt boundary used by the live interrupt path

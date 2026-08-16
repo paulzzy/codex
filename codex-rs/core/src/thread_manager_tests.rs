@@ -21,6 +21,10 @@ use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::mcp::MCP_APP_UI_EXTENSION_ID;
 use codex_protocol::mcp::OPENAI_FORM_EXTENSION_ID;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::LocalShellAction;
+use codex_protocol::models::LocalShellExecAction;
+use codex_protocol::models::LocalShellStatus;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelsResponse;
@@ -1990,6 +1994,122 @@ fn interrupted_fork_snapshot_appends_interrupt_boundary() {
 }
 
 #[test]
+fn interrupted_fork_snapshot_completes_unfinished_calls() {
+    let function_call = ResponseItem::FunctionCall {
+        id: None,
+        name: "function_tool".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        encrypted_function_args: None,
+        call_id: "function-1".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let tool_search_call = ResponseItem::ToolSearchCall {
+        id: None,
+        call_id: Some("search-1".to_string()),
+        status: Some("in_progress".to_string()),
+        execution: "client".to_string(),
+        arguments: serde_json::json!({"query": "needle"}),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let custom_tool_call = ResponseItem::CustomToolCall {
+        id: None,
+        status: None,
+        call_id: "custom-1".to_string(),
+        name: "custom_tool".to_string(),
+        namespace: None,
+        input: "{}".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let local_shell_call = ResponseItem::LocalShellCall {
+        id: None,
+        call_id: Some("shell-1".to_string()),
+        status: LocalShellStatus::InProgress,
+        action: LocalShellAction::Exec(LocalShellExecAction {
+            command: vec!["echo".to_string(), "hello".to_string()],
+            timeout_ms: None,
+            working_directory: None,
+            env: None,
+            user: None,
+        }),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let history = InitialHistory::Forked(vec![
+        RolloutItem::ResponseItem(user_msg("hello").into()),
+        RolloutItem::ResponseItem(function_call.clone().into()),
+        RolloutItem::ResponseItem(tool_search_call.clone().into()),
+        RolloutItem::ResponseItem(custom_tool_call.clone().into()),
+        RolloutItem::ResponseItem(local_shell_call.clone().into()),
+    ]);
+
+    let forked = fork_history_from_snapshot(
+        ForkSnapshot::Interrupted,
+        history,
+        InterruptedTurnHistoryMarker::ContextualUser,
+    );
+
+    assert_eq!(
+        serde_json::to_value(forked.get_rollout_items())
+            .expect("serialize repaired interrupted fork"),
+        serde_json::to_value(vec![
+            RolloutItem::ResponseItem(user_msg("hello").into()),
+            RolloutItem::ResponseItem(function_call.into()),
+            RolloutItem::ResponseItem(
+                ResponseItem::FunctionCallOutput {
+                    id: None,
+                    call_id: "function-1".to_string(),
+                    output: FunctionCallOutputPayload::from_text("aborted".to_string()),
+                    internal_chat_message_metadata_passthrough: None,
+                }
+                .into(),
+            ),
+            RolloutItem::ResponseItem(tool_search_call.into()),
+            RolloutItem::ResponseItem(
+                ResponseItem::ToolSearchOutput {
+                    id: None,
+                    call_id: Some("search-1".to_string()),
+                    status: "completed".to_string(),
+                    execution: "client".to_string(),
+                    tools: Vec::new(),
+                    internal_chat_message_metadata_passthrough: None,
+                }
+                .into(),
+            ),
+            RolloutItem::ResponseItem(custom_tool_call.into()),
+            RolloutItem::ResponseItem(
+                ResponseItem::CustomToolCallOutput {
+                    id: None,
+                    call_id: "custom-1".to_string(),
+                    name: None,
+                    output: FunctionCallOutputPayload::from_text("aborted".to_string()),
+                    internal_chat_message_metadata_passthrough: None,
+                }
+                .into(),
+            ),
+            RolloutItem::ResponseItem(local_shell_call.into()),
+            RolloutItem::ResponseItem(
+                ResponseItem::FunctionCallOutput {
+                    id: None,
+                    call_id: "shell-1".to_string(),
+                    output: FunctionCallOutputPayload::from_text("aborted".to_string()),
+                    internal_chat_message_metadata_passthrough: None,
+                }
+                .into(),
+            ),
+            RolloutItem::ResponseItem(contextual_user_interrupted_marker().into()),
+            RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
+                turn_id: None,
+                started_at: None,
+                reason: TurnAbortReason::Interrupted,
+                completed_at: None,
+                duration_ms: None,
+            })),
+        ])
+        .expect("serialize expected repaired interrupted fork"),
+    );
+}
+
+#[test]
 fn disabled_interrupted_fork_snapshot_appends_only_interrupt_event() {
     let committed_history =
         InitialHistory::Forked(vec![RolloutItem::ResponseItem(user_msg("hello").into())]);
@@ -2135,6 +2255,48 @@ fn mixed_response_and_legacy_user_event_history_is_mid_turn() {
             active_turn_id: None,
             active_turn_started_at: None,
             active_turn_start_index: None,
+        },
+    );
+}
+
+#[test]
+fn completed_legacy_prefix_does_not_hide_later_response_turn_start() {
+    let history = InitialHistory::Forked(vec![
+        RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            client_id: None,
+            message: "old question".to_string(),
+            images: None,
+            text_elements: Vec::new(),
+            local_images: Vec::new(),
+            ..Default::default()
+        })),
+        RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+            message: "old answer".to_string(),
+            phase: None,
+            memory_citation: None,
+        })),
+        RolloutItem::ResponseItem(user_msg("new question").into()),
+        RolloutItem::ResponseItem(
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "do_it".to_string(),
+                namespace: None,
+                arguments: "{}".to_string(),
+                call_id: "new-call".to_string(),
+                encrypted_function_args: None,
+                internal_chat_message_metadata_passthrough: None,
+            }
+            .into(),
+        ),
+    ]);
+
+    assert_eq!(
+        snapshot_turn_state(&history),
+        SnapshotTurnState {
+            ends_mid_turn: true,
+            active_turn_id: None,
+            active_turn_started_at: None,
+            active_turn_start_index: Some(2),
         },
     );
 }
