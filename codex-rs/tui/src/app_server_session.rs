@@ -667,6 +667,7 @@ impl AppServerSession {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn fork_side_thread(
         &mut self,
         config: Config,
@@ -776,7 +777,7 @@ impl AppServerSession {
         self.thread_params_mode
     }
 
-    fn session_config_with_effective_service_tier(&self, config: &Config) -> Config {
+    pub(crate) fn session_config_with_effective_service_tier(&self, config: &Config) -> Config {
         let Some(model) = config.model.as_deref().or(self.default_model.as_deref()) else {
             return config.clone();
         };
@@ -1002,6 +1003,7 @@ impl AppServerSession {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn thread_inject_items(
         &mut self,
         thread_id: ThreadId,
@@ -1434,6 +1436,54 @@ pub(crate) async fn start_thread_with_request_handle(
     started_thread_from_start_response(response, &config, thread_params_mode).await
 }
 
+pub(crate) async fn fork_thread_with_request_handle(
+    request_handle: AppServerRequestHandle,
+    config: Config,
+    thread_id: ThreadId,
+    thread_params_mode: ThreadParamsMode,
+    remote_cwd_override: Option<PathBuf>,
+) -> Result<AppServerStartedThread> {
+    let mut params = ThreadForkParams {
+        exclude_turns: true,
+        ..thread_fork_params_from_config(
+            config.clone(),
+            thread_id,
+            thread_params_mode,
+            remote_cwd_override.as_deref(),
+        )
+    };
+    let request_id = RequestId::String(format!("side-thread-fork-{}", Uuid::new_v4()));
+    let response: ThreadForkResponse = match request_handle
+        .request_typed(ClientRequest::ThreadFork {
+            request_id,
+            params: params.clone(),
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(TypedRequestError::Server { source, .. })
+            if is_history_pagination_unsupported(&source) =>
+        {
+            params.exclude_turns = false;
+            request_handle
+                .request_typed(ClientRequest::ThreadFork {
+                    request_id: RequestId::String(format!("side-thread-fork-{}", Uuid::new_v4())),
+                    params,
+                })
+                .await
+                .map_err(|err| {
+                    bootstrap_request_error("thread/fork failed during TUI bootstrap", err)
+                })?
+        }
+        Err(err) => {
+            return Err(bootstrap_request_error(
+                "thread/fork failed during TUI bootstrap",
+                err,
+            ));
+        }
+    };
+    started_thread_from_fork_response(response, &config, thread_params_mode).await
+}
 pub(crate) fn status_account_display_from_auth_mode(
     auth_mode: Option<AuthMode>,
     plan_type: Option<codex_protocol::account::PlanType>,

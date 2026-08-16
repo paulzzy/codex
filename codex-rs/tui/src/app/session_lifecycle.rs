@@ -281,6 +281,9 @@ impl App {
         app_server: &mut AppServerSession,
         thread_id: ThreadId,
     ) -> bool {
+        if self.side_threads.contains_key(&thread_id) {
+            return true;
+        }
         let existing_entry = self.agent_navigation.get(&thread_id).cloned();
         let has_replay_channel = self.thread_event_channels.contains_key(&thread_id);
         match app_server
@@ -592,6 +595,7 @@ impl App {
         self.thread_event_channels.clear();
         self.agent_navigation.clear();
         self.side_threads.clear();
+        self.pending_side_start = None;
         self.active_thread_id = None;
         self.active_thread_rx = None;
         self.primary_thread_id = None;

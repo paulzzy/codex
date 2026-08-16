@@ -226,6 +226,7 @@ mod resize_reflow;
 mod safety_buffering;
 mod session_lifecycle;
 mod side;
+mod side_server;
 mod startup;
 mod startup_prompts;
 mod thread_events;
@@ -242,6 +243,7 @@ use self::app_server_requests::PendingAppServerRequests;
 use self::loaded_threads::find_loaded_subagent_threads_for_primary;
 use self::pending_interactive_replay::PendingInteractiveReplayState;
 use self::platform_actions::*;
+use self::side::PendingSideStart;
 use self::side::SideParentStatus;
 use self::side::SideParentStatusChange;
 use self::side::SideThreadState;
@@ -592,6 +594,7 @@ pub(crate) struct App {
     agent_navigation: AgentNavigationState,
     side_threads: HashMap<ThreadId, SideThreadState>,
     abandoned_side_threads: HashSet<ThreadId>,
+    pending_side_start: Option<PendingSideStart>,
     active_thread_id: Option<ThreadId>,
     active_thread_rx: Option<mpsc::Receiver<ThreadBufferedEvent>>,
     primary_thread_id: Option<ThreadId>,

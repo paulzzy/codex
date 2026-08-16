@@ -2210,7 +2210,7 @@ async fn refresh_agent_picker_thread_liveness_prunes_closed_metadata_only_thread
 }
 
 #[tokio::test]
-async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()> {
+async fn handle_start_side_prepares_off_event_loop_and_seeds_navigation() -> Result<()> {
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let config = app.chat_widget.config_ref().clone();
     let parent_thread_id = ThreadId::from_string(
@@ -2237,18 +2237,34 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
     while app_event_rx.try_recv().is_ok() {}
     let mut tui = crate::tui::test_support::make_test_tui()?;
 
-    let control = Box::pin(app.handle_start_side(
-        &mut tui,
+    Box::pin(app.handle_start_side(
         &mut app_server,
         parent_thread_id,
         /*user_message*/ None,
     ))
     .await?;
 
+    assert_eq!(app.active_thread_id, Some(parent_thread_id));
+    assert!(app.pending_side_start.is_some());
+
+    let (request_id, result) = loop {
+        let event = time::timeout(
+            std::time::Duration::from_secs(/*secs*/ 2),
+            app_event_rx.recv(),
+        )
+        .await
+        .expect("side preparation should finish")
+        .expect("app event channel should remain open");
+        if let AppEvent::SideThreadPrepared(request_id, result) = event {
+            break (request_id, result);
+        }
+    };
+    app.handle_side_thread_prepared(&mut tui, &mut app_server, request_id, result)
+        .await?;
+
     let side_thread_id = app
         .active_thread_id
         .expect("side conversation should become active");
-    assert!(matches!(control, AppRunControl::Continue));
     assert_ne!(side_thread_id, parent_thread_id);
     assert!(app.side_threads.contains_key(&side_thread_id));
     assert!(app.thread_event_channels.contains_key(&side_thread_id));
@@ -2278,6 +2294,40 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
     }
 
     assert!(saw_thread_started);
+    app_server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_side_preparation_result_does_not_consume_newer_request() -> Result<()> {
+    let mut app = make_test_app().await;
+    let mut app_server =
+        crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
+    let parent_thread_id = ThreadId::new();
+    let pending_request_id = Uuid::new_v4();
+    app.active_thread_id = Some(parent_thread_id);
+    app.pending_side_start = Some(PendingSideStart {
+        request_id: pending_request_id,
+        side_state: SideThreadState::new(parent_thread_id),
+        user_message: Some(crate::chatwidget::UserMessage::from("newer question")),
+    });
+    let mut side_config = app.chat_widget.config_ref().clone();
+    side_config.ephemeral = true;
+    let stale = app_server.start_thread(&side_config).await?;
+    let stale_thread_id = stale.session.thread_id;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+
+    app.handle_side_thread_prepared(&mut tui, &mut app_server, Uuid::new_v4(), Ok(stale.session))
+        .await?;
+
+    assert_eq!(
+        app.pending_side_start
+            .as_ref()
+            .map(|pending| pending.request_id),
+        Some(pending_request_id)
+    );
+    assert!(app.abandoned_side_threads.contains(&stale_thread_id));
+    assert_eq!(app.active_thread_id, Some(parent_thread_id));
     app_server.shutdown().await?;
     Ok(())
 }
@@ -4908,6 +4958,7 @@ async fn make_test_app() -> App {
         agent_navigation: AgentNavigationState::default(),
         side_threads: HashMap::new(),
         abandoned_side_threads: HashSet::new(),
+        pending_side_start: None,
         active_thread_id: None,
         active_thread_rx: None,
         primary_thread_id: None,
@@ -4984,6 +5035,7 @@ async fn make_test_app_with_channels() -> (
             agent_navigation: AgentNavigationState::default(),
             side_threads: HashMap::new(),
             abandoned_side_threads: HashSet::new(),
+            pending_side_start: None,
             active_thread_id: None,
             active_thread_rx: None,
             primary_thread_id: None,

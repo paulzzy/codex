@@ -51,6 +51,7 @@ use crate::chatwidget::ConnectorScopeGeneration;
 use crate::chatwidget::ThreadUsageOutcome;
 use crate::chatwidget::UserMessage;
 use crate::goal_files::GoalDraft;
+use crate::session_state::ThreadSessionState;
 use codex_app_server_protocol::AskForApproval;
 use codex_config::types::ApprovalsReviewer;
 use codex_features::Feature;
@@ -61,6 +62,12 @@ use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
 
 use crate::history_cell::HistoryCell;
+
+#[derive(Debug)]
+pub(crate) struct SideThreadPrepareError {
+    pub(crate) thread_id: Option<ThreadId>,
+    pub(crate) error: color_eyre::Report,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThreadGoalSetMode {
@@ -211,6 +218,8 @@ pub(crate) enum AppEvent {
         parent_thread_id: ThreadId,
         user_message: Option<UserMessage>,
     },
+    /// Finish preparing a transient side conversation off the TUI event loop.
+    SideThreadPrepared(Uuid, Result<ThreadSessionState, SideThreadPrepareError>),
 
     /// Submit an op to the specified thread, regardless of current focus.
     SubmitThreadOp {
